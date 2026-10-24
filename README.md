@@ -56,7 +56,10 @@ the byte order (negative is little-endian), exactly one whitespace byte ends the
 header, and rows are stored bottom-up.
 
 `ssftool` reads and writes comma-separated `w,r,g,b` rows, with fewer channels
-allowed.
+allowed. Wavelengths print with two decimals and channels in the shortest form
+that reads back to the same float, so a chain of stages loses no digits however
+small the values get; `format` rounds them for the file that leaves the
+pipeline.
 
 ## Testing
 

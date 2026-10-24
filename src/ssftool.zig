@@ -188,9 +188,12 @@ pub fn parseData(a: Allocator, c: Ctx, lines: []const []const u8) Error![]Row {
 
 fn printRow(c: Ctx, r: Row) Error!void {
     try cformat.fixed(c.gpa, c.out, r.wavelength, 2);
-    for (r.values[0..r.count]) |v| {
+    for (r.values[0..r.count]) |value| {
         try c.out.writeByte(',');
-        try cformat.fixed(c.gpa, c.out, v, 6);
+        // The shortest decimal that reads back to the same float, so a chain of
+        // stages loses no digits however small the values get. `format` rounds
+        // for the file that leaves the pipeline.
+        try c.out.print("{d}", .{value});
     }
     try c.out.writeByte('\n');
 }
@@ -548,7 +551,7 @@ pub fn averageChannels(c: Ctx, reader: *Io.Reader) Error!void {
         for (r.values[0..r.count]) |v| sum += v;
         try cformat.fixed(c.gpa, c.out, r.wavelength, 2);
         try c.out.writeByte(',');
-        try cformat.fixed(c.gpa, c.out, sum / @as(f32, @floatFromInt(r.count)), 6);
+        try c.out.print("{d}", .{sum / @as(f32, @floatFromInt(r.count))});
         try c.out.writeByte('\n');
     }
 }
@@ -878,9 +881,29 @@ test "intervalize walks a descending wavelength axis" {
     var reader = Io.Reader.fixed("500,5\n480,4\n460,3\n440,2\n420,1\n");
     try intervalize(c, &reader, 420, 500, 40);
     try testing.expectEqualStrings(
-        \\420.00,1.000000
-        \\460.00,3.000000
-        \\500.00,5.000000
+        \\420.00,1
+        \\460.00,3
+        \\500.00,5
+        \\
+    , out.buffered());
+}
+
+test "format rounds to the requested precision" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var sink: [256]u8 = undefined;
+    var out: Io.Writer = .fixed(&sink);
+    var err_buf: [256]u8 = undefined;
+    var errw: Io.Writer = .fixed(&err_buf);
+    const c: Ctx = .{ .gpa = a, .out = &out, .errw = &errw };
+
+    var reader = Io.Reader.fixed("400,1.234,2.346,3.456\n405.9,4.5,5.25,6.125\n");
+    try formatOp(c, &reader, 2);
+    try testing.expectEqualStrings(
+        \\400,1.23,2.35,3.46
+        \\405,4.50,5.25,6.12
         \\
     , out.buffered());
 }

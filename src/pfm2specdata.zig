@@ -130,14 +130,8 @@ pub fn process(c: ssftool.Ctx, img: pfm.Image, debug: bool) ssftool.Error!void {
             gsum += p[1];
             bsum += p[2];
         }
-        try cformat.int(c.out, index);
-        try c.out.writeByte(',');
-        try cformat.fixed(a, c.out, rsum / divisor, 6);
-        try c.out.writeByte(',');
-        try cformat.fixed(a, c.out, gsum / divisor, 6);
-        try c.out.writeByte(',');
-        try cformat.fixed(a, c.out, bsum / divisor, 6);
-        try c.out.writeByte('\n');
+        // Full precision, so the stages downstream start from every digit.
+        try c.out.print("{d},{d},{d},{d}\n", .{ index, rsum / divisor, gsum / divisor, bsum / divisor });
     }
 }
 
@@ -236,10 +230,10 @@ test "finds the band and averages the columns, right to left" {
     // mix -> 0.5 green, 0.8 blue.
     const got = try readout(a, img, false);
     try testing.expectEqualStrings(
-        \\0,0.700000,0.500000,0.800000
-        \\1,0.500000,0.500000,0.600000
-        \\2,0.300000,0.500000,0.400000
-        \\3,0.100000,0.500000,0.200000
+        \\0,0.7,0.5,0.8
+        \\1,0.5,0.5,0.6
+        \\2,0.3,0.5,0.4
+        \\3,0.1,0.5,0.2
         \\
     , got);
 }

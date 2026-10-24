@@ -228,9 +228,9 @@ const cases = [_]Case{
     .{ .name = "averagefiles-differing-files", .argv = &.{ "averagefiles", "@avg1.csv", "@avg3.csv" }, .deviation = .{
         .reason = "upstream sums one channel per row (row 0's red, row 1's green, ...); the port averages every channel",
         .stdout =
-        \\400.00,5.500000,11.000000,16.500000
-        \\405.00,22.000000,27.500000,33.000000
-        \\410.00,38.500000,44.000000,49.500000
+        \\400.00,5.5,11,16.5
+        \\405.00,22,27.5,33
+        \\410.00,38.5,44,49.5
         \\
         ,
     } },
@@ -257,7 +257,7 @@ const cases = [_]Case{
     .{ .name = "intervalize-exact-hit", .argv = &.{ "intervalize", "@spectrum.csv", "400,450,50" }, .deviation = .{
         .reason = "upstream divides by a zero interval and takes the following measurement",
         .stdout =
-        \\400.00,0.000071,0.000150,0.000200
+        \\400.00,0.000071,0.00015,0.0002
         \\450.00,0.002987,0.005678,0.002345
         \\
         ,
@@ -327,18 +327,18 @@ const cases = [_]Case{
     .{ .name = "wavelengthcalibrate-mirrored", .argv = &.{ "wavelengthcalibrate", "@spectrum.csv", "blue=410,green=425,red=445", "@mirror_calib.csv" }, .deviation = .{
         .reason = "a mirrored capture: upstream's unsigned marker arithmetic gives every row the last marker's wavelength",
         .stdout =
-        \\455.00,0.000071,0.000150,0.000200
+        \\455.00,0.000071,0.00015,0.0002
         \\450.00,0.000069,0.000147,0.000197
-        \\445.00,0.000068,0.000150,0.000189
+        \\445.00,0.000068,0.00015,0.000189
         \\440.00,0.000123,0.000321,0.000456
         \\435.00,0.000456,0.000654,0.000789
         \\430.00,0.000789,0.000987,0.001234
-        \\425.00,0.001234,0.001567,0.001890
-        \\422.00,0.001890,0.002345,0.002678
-        \\419.00,0.002678,0.003456,0.003210
-        \\416.00,0.003210,0.004567,0.002987
+        \\425.00,0.001234,0.001567,0.00189
+        \\422.00,0.00189,0.002345,0.002678
+        \\419.00,0.002678,0.003456,0.00321
+        \\416.00,0.00321,0.004567,0.002987
         \\413.00,0.002987,0.005678,0.002345
-        \\410.00,0.002345,0.006789,0.001890
+        \\410.00,0.002345,0.006789,0.00189
         \\
         ,
     } },
@@ -408,6 +408,40 @@ fn readFile(a: Allocator, io: Io, path: []const u8) ![]u8 {
 fn resolve(a: Allocator, dir: []const u8, arg: []const u8) ![]const u8 {
     if (arg.len == 0 or arg[0] != '@') return arg;
     return std.fs.path.join(a, &.{ dir, arg[1..] });
+}
+
+/// Compares two outputs field by field. Fields that both parse as numbers are
+/// compared as numbers, within the rounding of the six decimals the reference
+/// prints; anything else is compared as text. NaN matches NaN.
+fn sameValues(c: []const u8, z: []const u8) bool {
+    var c_lines = std.mem.splitScalar(u8, c, '\n');
+    var z_lines = std.mem.splitScalar(u8, z, '\n');
+    while (c_lines.next()) |c_line| {
+        const z_line = z_lines.next() orelse return false;
+        if (!sameLine(c_line, z_line)) return false;
+    }
+    return z_lines.next() == null;
+}
+
+fn sameLine(c: []const u8, z: []const u8) bool {
+    var c_fields = std.mem.splitScalar(u8, c, ',');
+    var z_fields = std.mem.splitScalar(u8, z, ',');
+    while (c_fields.next()) |c_field| {
+        const z_field = z_fields.next() orelse return false;
+        if (!sameField(c_field, z_field)) return false;
+    }
+    return z_fields.next() == null;
+}
+
+fn sameField(c: []const u8, z: []const u8) bool {
+    const c_value = std.fmt.parseFloat(f64, c) catch return std.mem.eql(u8, c, z);
+    const z_value = std.fmt.parseFloat(f64, z) catch return false;
+    if (std.math.isNan(c_value)) return std.math.isNan(z_value);
+    if (std.math.isInf(c_value) or std.math.isInf(z_value)) return c_value == z_value;
+    // The reference rounds to six decimals; the port prints the shortest form
+    // that reads back, so allow that much rounding plus a float's own slack.
+    const tolerance = 1e-6 + @abs(c_value) * 1e-6;
+    return @abs(c_value - z_value) <= tolerance;
 }
 
 fn firstDiffLine(x: []const u8, y: []const u8) ?usize {
@@ -488,9 +522,10 @@ pub fn main(init: std.process.Init) !u8 {
         const oc = try runBinary(a, io, dir, c_exe, argv, "c", case.stdin);
         const oz = try runBinary(a, io, dir, zig_exe, argv, "z", case.stdin);
 
-        // Only the data each tool writes is compared: no exit statuses, no
-        // messages, no usage text.
-        const same = std.mem.eql(u8, oc.stdout, oz.stdout);
+        // Only the data each tool writes is compared, value by value: no exit
+        // statuses, no messages, no usage text, and no dependence on how a
+        // number happens to be spelled.
+        const same = sameValues(oc.stdout, oz.stdout);
 
         if (case.deviation) |dev| {
             deviations += 1;
@@ -556,7 +591,7 @@ fn pipelineCheck(
     const names = [_][]const u8{ "spectrum.csv", "calibration.csv", "wavelength.csv", "interval.csv", "power.csv", "normalized.csv", "format.csv" };
     var failures: usize = 0;
     for (c_stages, z_stages, names) |c, z, name| {
-        if (std.mem.eql(u8, c, z)) continue;
+        if (sameValues(c, z)) continue;
         failures += 1;
         try out.print("FAIL pipeline:{s}\n", .{name});
         try describe("stdout", c, z, out);
