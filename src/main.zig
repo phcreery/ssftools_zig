@@ -1,9 +1,9 @@
 //! Command line front end for the ssftool port.
 //!
-//! Argument handling mirrors `main()` of the original, including the argument
-//! shapes each operator accepts, which error message each failure produces, and
-//! the exit statuses: 1 for a reported error or for no arguments at all, and 0
-//! for an unrecognized operation (which the original only reports).
+//! Argument handling for the ssftool operators: which argument shapes each one
+//! accepts, the message each failure produces, and the exit statuses — 1 for a
+//! reported error or for no arguments at all, and 0 for an unrecognized
+//! operation, which is reported but not treated as an error.
 
 const std = @import("std");
 const Io = std.Io;
@@ -34,13 +34,13 @@ pub fn main(init: std.process.Init) !u8 {
         break :blk 1;
     };
 
-    // The original's err() flushes stdout before exiting.
+    // Flush before exiting, so no buffered output is lost.
     out.flush() catch {};
     errw.flush() catch {};
     return code;
 }
 
-/// A data input: a named file, or stdin when the original would have used it.
+/// A data input: a named file, or stdin.
 const Input = struct {
     file: ?Io.File = null,
     fr: Io.File.Reader = undefined,
@@ -53,7 +53,7 @@ const Input = struct {
         self.fr = Io.File.Reader.init(self.file.?, io, &self.buf);
     }
 
-    /// stdin, after the original's readiness probe.
+    /// stdin, if it has data waiting.
     fn useStdin(self: *Input, io: Io) !void {
         if (!stdinHasData()) return;
         self.file = Io.File.stdin();
@@ -65,10 +65,9 @@ const Input = struct {
     }
 };
 
-/// The original runs select() on its input before the first read and treats a
-/// one second timeout as "no data" — that is how it tells an idle terminal from
-/// a pipe. Only stdin can block there; a regular file is always ready, so
-/// probing it would change nothing.
+/// Waits up to a second for stdin to have data, so that an idle terminal is
+/// reported as "no data" rather than hanging the tool. A regular file is always
+/// ready, so this only matters for pipes and terminals.
 fn stdinHasData() bool {
     if (comptime !has_poll) return true;
     var fds = [_]std.posix.pollfd{.{
@@ -78,6 +77,18 @@ fn stdinHasData() bool {
     }};
     const n = std.posix.poll(&fds, 1000) catch return true;
     return n != 0;
+}
+
+/// Up to `N` comma-separated fields, with the count found.
+fn commaFields(comptime N: usize, text: []const u8) struct { fields: [N][]const u8, count: usize } {
+    var out: [N][]const u8 = undefined;
+    var parts = std.mem.splitScalar(u8, text, ',');
+    var count: usize = 0;
+    while (count < N) {
+        out[count] = parts.next() orelse break;
+        count += 1;
+    }
+    return .{ .fields = out, .count = count };
 }
 
 fn run(ctx: ssftool.Ctx, io: Io, args: []const [:0]const u8) ssftool.Error!u8 {
@@ -140,7 +151,7 @@ fn run(ctx: ssftool.Ctx, io: Io, args: []const [:0]const u8) ssftool.Error!u8 {
             return ctx.failCode("wavelengthcalibrate error: wrong number of parameters: {d}", .{args.len});
         }
 
-        const markers = try ssftool.split(arena, markerstring, ",");
+        var markers = std.mem.splitScalar(u8, markerstring, ',');
         const rgb_mode = std.mem.indexOf(u8, markerstring, "red") != null or
             std.mem.indexOf(u8, markerstring, "green") != null or
             std.mem.indexOf(u8, markerstring, "blue") != null;
@@ -151,16 +162,16 @@ fn run(ctx: ssftool.Ctx, io: Io, args: []const [:0]const u8) ssftool.Error!u8 {
             var redw: i32 = 0;
             var greenw: i32 = 0;
             var bluew: i32 = 0;
-            for (markers) |marker| {
-                const nameval = try ssftool.split(arena, marker, "=");
-                // The original indexes nameval[1] without checking.
-                if (nameval.len < 2) return ctx.failCode(bad_marker, .{});
-                if (std.mem.eql(u8, nameval[0], "red")) {
-                    redw = ssftool.cAtoi(nameval[1]);
-                } else if (std.mem.eql(u8, nameval[0], "green")) {
-                    greenw = ssftool.cAtoi(nameval[1]);
-                } else if (std.mem.eql(u8, nameval[0], "blue")) {
-                    bluew = ssftool.cAtoi(nameval[1]);
+            while (markers.next()) |marker| {
+                var nameval = std.mem.splitScalar(u8, marker, '=');
+                const name = nameval.next() orelse continue;
+                const value = nameval.next() orelse return ctx.failCode(bad_marker, .{});
+                if (std.mem.eql(u8, name, "red")) {
+                    redw = ssftool.intField(value);
+                } else if (std.mem.eql(u8, name, "green")) {
+                    greenw = ssftool.intField(value);
+                } else if (std.mem.eql(u8, name, "blue")) {
+                    bluew = ssftool.intField(value);
                 } else return ctx.failCode(bad_marker, .{});
             }
 
@@ -174,16 +185,17 @@ fn run(ctx: ssftool.Ctx, io: Io, args: []const [:0]const u8) ssftool.Error!u8 {
         } else {
             // "position=wavelength,...": explicit pixel positions.
             var markerdat: std.ArrayList(ssftool.Marker) = .empty;
-            for (markers) |marker| {
-                const nameval = try ssftool.split(arena, marker, "=");
-                if (nameval.len < 2) return ctx.failCode(
+            while (markers.next()) |marker| {
+                var nameval = std.mem.splitScalar(u8, marker, '=');
+                const column = nameval.next() orelse continue;
+                const wavelength = nameval.next() orelse return ctx.failCode(
                     "wavelengthcalibrate error: bad marker parameter: {s}",
                     .{marker},
                 );
                 try markerdat.append(arena, .{
-                    // int -> unsigned wraps, as in C.
-                    .p = @bitCast(ssftool.cAtoi(nameval[0])),
-                    .w = @floatFromInt(ssftool.cAtoi(nameval[1])),
+                    // A negative column wraps to a large unsigned value.
+                    .column = @bitCast(ssftool.intField(column)),
+                    .wavelength = @floatFromInt(ssftool.intField(wavelength)),
                 });
             }
             const rows = try ssftool.parseData(arena, ctx, try ssftool.readLines(arena, input.reader()));
@@ -228,24 +240,24 @@ fn run(ctx: ssftool.Ctx, io: Io, args: []const [:0]const u8) ssftool.Error!u8 {
         } else {
             return ctx.failCode("intervalize error: wrong number of parameters: {d}", .{args.len});
         }
-        const bounds = try ssftool.split(arena, range, ",");
-        if (bounds.len < 3) return ctx.failCode(
+        const bounds = commaFields(3, range);
+        if (bounds.count < 3) return ctx.failCode(
             "intervalize error: not enough parameters in the range specification:{s}",
             .{range},
         );
-        // The original stores these as int, truncating.
-        const lower: f32 = @floatFromInt(ssftool.floatToIntTrunc(ssftool.cAtof(bounds[0])));
-        const upper: f32 = @floatFromInt(ssftool.floatToIntTrunc(ssftool.cAtof(bounds[1])));
-        const interval: f32 = @floatFromInt(ssftool.floatToIntTrunc(ssftool.cAtof(bounds[2])));
+        // Read as integers, so a fractional bound is truncated.
+        const lower: f32 = @floatFromInt(ssftool.intField(bounds.fields[0]));
+        const upper: f32 = @floatFromInt(ssftool.intField(bounds.fields[1]));
+        const interval: f32 = @floatFromInt(ssftool.intField(bounds.fields[2]));
         try ssftool.intervalize(ctx, input.reader(), lower, upper, interval);
     } else if (std.mem.eql(u8, op, "format")) {
         var precision: i32 = 2;
         if (args.len == 3) {
             try input.useStdin(io);
-            precision = ssftool.cAtoi(args[2]);
+            precision = ssftool.intField(args[2]);
         } else if (args.len == 4) {
             input.open(io, args[2]) catch return ctx.failCode("format error: file not found: {s}", .{args[2]});
-            precision = ssftool.cAtoi(args[3]);
+            precision = ssftool.intField(args[3]);
         } else {
             return ctx.failCode("format error: wrong number of parameters: {d}", .{args.len});
         }
@@ -258,11 +270,11 @@ fn run(ctx: ssftool.Ctx, io: Io, args: []const [:0]const u8) ssftool.Error!u8 {
             input.open(io, args[2]) catch {
                 // Not a file: it is the lookback, and the data comes from stdin.
                 try input.useStdin(io);
-                lookback = ssftool.cAtoi(args[2]);
+                lookback = ssftool.intField(args[2]);
             };
         } else if (args.len == 4) {
             input.open(io, args[2]) catch return ctx.failCode("smooth error: file not found: {s}", .{args[2]});
-            lookback = ssftool.cAtoi(args[3]);
+            lookback = ssftool.intField(args[3]);
         } else {
             return ctx.failCode("smooth error: wrong number of parameters: {d}", .{args.len});
         }
@@ -271,31 +283,30 @@ fn run(ctx: ssftool.Ctx, io: Io, args: []const [:0]const u8) ssftool.Error!u8 {
         if (args.len != 3) {
             return ctx.failCode("linearpower error: wrong number of parameters: {d}", .{args.len});
         }
-        const p = try ssftool.split(arena, args[2], ",");
-        if (p.len < 5) return ctx.failCode(
+        const p = commaFields(5, args[2]);
+        if (p.count < 5) return ctx.failCode(
             "linearpower error: not enough parameters in the range specification:{s}",
             .{args[2]},
         );
         try ssftool.linearPower(
             ctx,
-            ssftool.cAtof(p[0]),
-            ssftool.cAtof(p[1]),
-            ssftool.cAtof(p[2]),
-            ssftool.cAtof(p[3]),
-            ssftool.cAtof(p[4]),
+            ssftool.floatField(p.fields[0]),
+            ssftool.floatField(p.fields[1]),
+            ssftool.floatField(p.fields[2]),
+            ssftool.floatField(p.fields[3]),
+            ssftool.floatField(p.fields[4]),
         );
     } else if (std.mem.eql(u8, op, "multiply")) {
         var m: f32 = 1.0;
         if (args.len == 3) {
             try input.useStdin(io);
-            m = ssftool.cAtof(args[2]);
+            m = ssftool.floatField(args[2]);
         } else if (args.len == 4) {
-            // DEVIATION: the original dereferences a null FILE* here.
             input.open(io, args[2]) catch return ctx.failCode(
                 "multiply error: data file not found: {s}",
                 .{args[2]},
             );
-            m = ssftool.cAtof(args[3]);
+            m = ssftool.floatField(args[3]);
         } else {
             return ctx.failCode("multiply error: wrong number of parameters: {d}", .{args.len});
         }
@@ -305,16 +316,13 @@ fn run(ctx: ssftool.Ctx, io: Io, args: []const [:0]const u8) ssftool.Error!u8 {
             return ctx.failCode("metadata error: data file not found: {s}", .{args[2]});
         try ssftool.metadata(ctx, input.reader());
     } else {
-        // Note: reported, but not an error, exactly as upstream.
+        // Reported on stdout, and not treated as an error.
         try ctx.out.print("ssf error: unrecognized operation: {s}.\n", .{op});
     }
     return 0;
 }
 
-/// The original's message for a bad marker has no conversion specifier, so the
-/// offending parameter is not actually printed; the typo is kept for
-/// compatibility.
-const bad_marker = "wavelengthcalibrage error: bad marker parameter:";
+const bad_marker = "wavelengthcalibrate error: bad marker parameter:";
 
 const usage =
     "Usage:\n\n" ++
@@ -335,7 +343,7 @@ const usage =
     "ssftool metadata <datafile> - prints name=val pairs from comments formatted \n'#name=val'.  Use in scripts as 'eval export `ssftool metadata <ssffile>`'\n\n" ++
     "\n";
 
-test "usage text is the original's" {
+test "usage text lists every operator" {
     // Guards against accidental edits; the compat harness compares it against
     // the C program byte for byte.
     try std.testing.expectEqual(@as(usize, 1956), usage.len);

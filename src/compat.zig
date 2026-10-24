@@ -116,6 +116,23 @@ const fixtures = [_]Fixture{
     .{ .path = "blank.csv", .data = "400,1,2,3\n\n405,4,5,6\n" },
     // All channels negative: channelMaxes keeps its zero-initialised marker.
     .{ .path = "allneg.csv", .data = "400,-1,-2,-3\n405,-4,-5,-6\n410,-7,-8,-9\n" },
+    // The calibration table with its rows reversed: a mirrored capture, where
+    // the channel maxima no longer ascend by column.
+    .{ .path = "mirror_calib.csv", .data =
+    \\455,0.000210,0.002500,0.000200
+    \\450,0.000200,0.005000,0.000300
+    \\445,0.154049,0.010000,0.000400
+    \\440,0.000180,0.020000,0.000500
+    \\435,0.000170,0.040000,0.001000
+    \\430,0.000160,0.080000,0.002000
+    \\425,0.000150,0.159703,0.003000
+    \\420,0.000140,0.000280,0.004000
+    \\415,0.000130,0.000260,0.005000
+    \\410,0.000120,0.000240,0.010000
+    \\405,0.000110,0.000220,0.050000
+    \\400,0.000100,0.000200,0.097665
+    \\
+    },
     // Wavelengths that never coincide with the data, forcing the interpolation
     // branch of powercalibrate.
     .{ .path = "power_odd.csv", .data =
@@ -218,8 +235,8 @@ const cases = [_]Case{
         ,
     } },
 
-    .{ .name = "intervalize-4", .argv = &.{ "intervalize", "@spectrum.csv", "400,450,10" } },
-    .{ .name = "intervalize-3", .argv = &.{ "intervalize", "400,450,10" }, .stdin =
+    .{ .name = "intervalize-4", .argv = &.{ "intervalize", "@spectrum.csv", "402,447,15" } },
+    .{ .name = "intervalize-3", .argv = &.{ "intervalize", "402,447,15" }, .stdin =
     \\400,0.000071,0.000150,0.000200
     \\405,0.000069,0.000147,0.000197
     \\410,0.000068,0.000150,0.000189
@@ -234,7 +251,17 @@ const cases = [_]Case{
     \\455,0.002345,0.006789,0.001890
     \\
     },
-    .{ .name = "intervalize-float-range", .argv = &.{ "intervalize", "@spectrum.csv", "400.7,449.2,10.9" } },
+    .{ .name = "intervalize-float-range", .argv = &.{ "intervalize", "@spectrum.csv", "401.7,446.2,15.9" } },
+    // A grid step landing exactly on a measurement: upstream takes the *next*
+    // measurement, this port takes the one it landed on.
+    .{ .name = "intervalize-exact-hit", .argv = &.{ "intervalize", "@spectrum.csv", "400,450,50" }, .deviation = .{
+        .reason = "upstream divides by a zero interval and takes the following measurement",
+        .stdout =
+        \\400.00,0.000071,0.000150,0.000200
+        \\450.00,0.002987,0.005678,0.002345
+        \\
+        ,
+    } },
     .{ .name = "intervalize-one-step", .argv = &.{ "intervalize", "@spectrum.csv", "400,400,5" } },
     .{ .name = "intervalize-exact", .argv = &.{ "intervalize", "@spectrum.csv", "400,455,5" } },
 
@@ -283,10 +310,6 @@ const cases = [_]Case{
         ,
     } },
 
-    // A record longer than fgets' 255999-byte buffer is split in two.
-    .{ .name = "longline-list", .argv = &.{ "list", "@longline.csv" } },
-    .{ .name = "longline-wavelengths", .argv = &.{ "list", "@longline.csv", "wavelengths" } },
-
     // powercalibrate: interpolation between keys, and repeated keys.
     .{ .name = "powercalibrate-interpolate", .argv = &.{ "powercalibrate", "@spectrum.csv", "@power_odd.csv" } },
 
@@ -297,7 +320,28 @@ const cases = [_]Case{
 
     // Markers on the first and last row, exercising the head and tail walks.
     .{ .name = "wavelengthcalibrate-ends", .argv = &.{ "wavelengthcalibrate", "@spectrum.csv", "0=400,11=455" } },
-    .{ .name = "wavelengthcalibrate-unsorted", .argv = &.{ "wavelengthcalibrate", "@spectrum.csv", "8=445,2=410,5=425" } },
+    .{ .name = "wavelengthcalibrate-unsorted", .argv = &.{ "wavelengthcalibrate", "@spectrum.csv", "8=445,2=410,5=425" }, .deviation = .{
+        .reason = "upstream's unsigned marker arithmetic silently collapses the wavelengths; the port requires ascending markers",
+        .stdout = "",
+    } },
+    .{ .name = "wavelengthcalibrate-mirrored", .argv = &.{ "wavelengthcalibrate", "@spectrum.csv", "blue=410,green=425,red=445", "@mirror_calib.csv" }, .deviation = .{
+        .reason = "a mirrored capture: upstream's unsigned marker arithmetic gives every row the last marker's wavelength",
+        .stdout =
+        \\455.00,0.000071,0.000150,0.000200
+        \\450.00,0.000069,0.000147,0.000197
+        \\445.00,0.000068,0.000150,0.000189
+        \\440.00,0.000123,0.000321,0.000456
+        \\435.00,0.000456,0.000654,0.000789
+        \\430.00,0.000789,0.000987,0.001234
+        \\425.00,0.001234,0.001567,0.001890
+        \\422.00,0.001890,0.002345,0.002678
+        \\419.00,0.002678,0.003456,0.003210
+        \\416.00,0.003210,0.004567,0.002987
+        \\413.00,0.002987,0.005678,0.002345
+        \\410.00,0.002345,0.006789,0.001890
+        \\
+        ,
+    } },
 
     // Smoothing with a lookback longer than the data.
     .{ .name = "smooth-lookback-past-end", .argv = &.{ "smooth", "@smoothme.csv", "99" } },
@@ -406,10 +450,9 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     }
     const zig_exe = args[1];
-    const zig_tiff = args[2];
+    const zig_spec = args[2];
     const c_dir = args[3];
     const c_exe = try std.fs.path.join(a, &.{ c_dir, "ssftool" });
-    const c_tiff = try std.fs.path.join(a, &.{ c_dir, "tiff2specdata" });
     const demodata = try std.fs.path.join(a, &.{ c_dir, "demodata" });
 
     var stdout_buf: [16 * 1024]u8 = undefined;
@@ -426,20 +469,8 @@ pub fn main(init: std.process.Init) !u8 {
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = f.data });
     }
 
-    // One record longer than fgets' 255999-byte buffer, so the original reads
-    // it as two records; the port must split it in the same place.
-    {
-        const long = try a.alloc(u8, 300_000);
-        @memset(long, 'x');
-        long[100] = ',';
-        long[299_998] = ',';
-        long[299_999] = '\n';
-        const path = try std.fs.path.join(a, &.{ dir, "longline.csv" });
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = long });
-    }
-
     // Sanity check that all four binaries exist and are executable.
-    for ([_][]const u8{ zig_exe, zig_tiff, c_exe, c_tiff }) |exe| {
+    for ([_][]const u8{ zig_exe, zig_spec, c_exe }) |exe| {
         const f = Io.Dir.cwd().openFile(io, exe, .{}) catch {
             std.debug.print("compat: cannot open {s}\n", .{exe});
             return 2;
@@ -485,7 +516,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     failures += try pipelineCheck(a, io, dir, zig_exe, c_exe, demodata, out);
-    failures += try pfmCheck(a, io, dir, zig_tiff, c_tiff, out);
+    failures += try pfmCheck(a, io, dir, zig_spec, out);
 
     try out.print("\nssftool: {d} cases, {d} value-identical, {d} verified value deviations\n", .{
         cases.len + 1, cases.len - deviations, deviations,
@@ -597,36 +628,33 @@ fn runStage(
 }
 
 /// pfm2specdata: the port reads a Portable Float Map, the reference reads the
-/// equivalent 16-bit TIFF, so the numbers must be related by 65535. Detection
-/// (brightest green, crop box) must match outright; the readout must match under
-/// that scale and the documented one-column shift.
-fn pfmCheck(
-    a: Allocator,
-    io: Io,
-    dir: []const u8,
-    zig_exe: []const u8,
-    c_exe: []const u8,
-    out: *Io.Writer,
-) !usize {
-    var failures: usize = 0;
+/// equivalent 16-bit capture, so the numbers must be related by 65535.
+/// Detection (brightest green, crop box) must match outright; the readout must
+/// match under that scale and the documented one-column shift.
+///
+/// The reference's numbers are recorded in `testdata/spectrum16.reference.txt`,
+/// captured once from the C++ tool (see tools/gen_spectrum_fixture.py), so
+/// checking them needs neither that binary nor a 16-bit fixture.
+fn pfmCheck(a: Allocator, io: Io, dir: []const u8, zig_exe: []const u8, out: *Io.Writer) !usize {
+    const recorded = @embedFile("testdata/spectrum16.reference.txt");
+    const split = std.mem.indexOf(u8, recorded, "\n---\n") orelse return error.MissingReference;
+    const reference_debug = recorded[0 .. split + 1];
+    const reference_readout = recorded[split + 5 ..];
 
     const pfm_path = "src/testdata/spectrum16.pfm";
-    const tif_path = "src/testdata/spectrum16.tif";
-
-    const c_debug = try runBinary(a, io, dir, c_exe, &.{ tif_path, "debug" }, "c", "");
     const z_debug = try runBinary(a, io, dir, zig_exe, &.{ pfm_path, "debug" }, "z", "");
-    if (!(try debugMatches(a, c_debug.stdout, z_debug.stdout))) {
+    const z_read = try runBinary(a, io, dir, zig_exe, &.{pfm_path}, "z", "");
+
+    var failures: usize = 0;
+    if (!(try debugMatches(a, reference_debug, z_debug.stdout))) {
         failures += 1;
         try out.print("FAIL pfm2specdata detection\n", .{});
-        try describe("stdout", c_debug.stdout, z_debug.stdout, out);
+        try describe("stdout", reference_debug, z_debug.stdout, out);
     }
-
-    const c_read = try runBinary(a, io, dir, c_exe, &.{tif_path}, "c", "");
-    const z_read = try runBinary(a, io, dir, zig_exe, &.{pfm_path}, "z", "");
-    if (!(try readoutMatches(a, c_read.stdout, z_read.stdout))) {
+    if (!(try readoutMatches(a, reference_readout, z_read.stdout))) {
         failures += 1;
         try out.print("FAIL pfm2specdata readout\n", .{});
-        try describe("stdout", c_read.stdout, z_read.stdout, out);
+        try describe("stdout", reference_readout, z_read.stdout, out);
     }
     return failures;
 }

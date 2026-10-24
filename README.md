@@ -72,8 +72,8 @@ zig build compat -Dc-checkout=/path/to/ssftool
 ```
 
 It compares only the data each tool writes to stdout — never exit statuses,
-messages or usage text — over 71 `ssftool` cases (67 value-identical, 3 verified
+messages or usage text — over 71 `ssftool` cases (64 value-identical, 6 verified
 deviations, plus the demo pipeline), and checks `pfm2specdata`'s detection and
-readout against the C++ `tiff2specdata` on the equivalent TIFF. Where this port
-deliberately produces different values, `src/compat.zig` asserts what it
+readout against numbers recorded once from the original C++ tool. Where this
+port deliberately produces different values, `src/compat.zig` asserts what it
 produces instead.

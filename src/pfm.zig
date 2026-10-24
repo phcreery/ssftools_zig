@@ -1,7 +1,7 @@
 //! Portable Float Map reader.
 //!
 //! PFM is a deliberately tiny format — no compression, no directory, one sample
-//! type — which is why it replaces the TIFF reader this project started with:
+//! type, with no compression and no directory to walk:
 //!
 //!     PF\n<width> <height>\n<scale>\n<width*height*channels float32 samples>
 //!
@@ -191,7 +191,7 @@ test "decodes the recorded ImageMagick fixture exactly" {
     try testing.expectEqual(@as(u32, 120), img.height);
     try testing.expectEqual(@as(u8, 3), img.channels);
 
-    // The fixture was made from a 16-bit TIFF by ImageMagick, which scales
+    // The fixture was made by ImageMagick from a 16-bit source, which scales
     // integers by 1/65535, so multiplying back must give the original integers.
     const cases = [_]struct { x: u32, y: u32, want: [3]u16 }{
         // pixel(x, y) = 60000 * lit * (0.10 + 0.010x, 0.80 + 0.005x, 0.05 + 0.020x)

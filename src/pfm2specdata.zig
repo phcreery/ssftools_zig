@@ -1,27 +1,16 @@
 //! Reads a Portable Float Map of a spectrum and prints one `x,r,g,b` row per
 //! column, right to left.
 //!
-//! The pipeline is the reference tiff2specdata's: find the brightest green pixel
-//! that is not dominated by red or blue, walk that column to locate the
-//! illuminated band, centre a 100 row crop on it, then average each column of
-//! the crop.
+//! Reads a Portable Float Map of a spectrum and prints one `index,r,g,b` row per
+//! column, right to left.
 //!
-//! Three things differ from the C++ original, all deliberate:
+//! Find the brightest green pixel that is not dominated by red or blue, walk
+//! that column to locate the illuminated band, centre a crop on it, then average
+//! each column of the crop.
 //!
-//! * **float samples, not 16-bit integers.** PFM's native type is float32, so
-//!   the maxes and thresholds stay in float; there is no `unsigned gthreshold =
-//!   gmax * 0.7` truncation to reproduce.
-//! * **a true mean over the crop.** Upstream divides by the constant `band`
-//!   (100) even when the crop was clamped to a shorter image, which under-reports
-//!   those columns. This divides by the crop's actual height; for a crop of 100
-//!   rows the two agree exactly. It is a single global factor, so nothing
-//!   downstream (normalise, powercalibrate) sees a difference.
-//! * **float output.** Channels print with `%f`; upstream's `%0.0f` would
-//!   quantise a 0..1 measurement to zero.
-//!
-//! The readout is still right to left: index 0 is the rightmost column, so the
-//! wavelengths increase with the row index for a capture whose long wavelengths
-//! are on the left.
+//! Index 0 is the rightmost column, so wavelengths increase down the file for a
+//! capture whose long wavelengths are on the left; a mirrored capture works too
+//! and simply comes out descending. Channels print with six decimals.
 
 const std = @import("std");
 const Io = std.Io;
@@ -29,7 +18,7 @@ const ssftool = @import("ssftool.zig");
 const pfm = @import("pfm.zig");
 const cformat = @import("cformat.zig");
 
-/// Rows averaged per column, as upstream's `band`.
+/// Height of the crop averaged per column.
 const band: u32 = 100;
 
 /// The readout: `index,r,g,b` per column of the crop.
@@ -304,7 +293,7 @@ test "detects the recorded fixture the way the reference does" {
     const img = try pfm.read(a, @embedFile("testdata/spectrum16.pfm"));
     const got = try readout(a, img, true);
 
-    // The reference C++ tool, run on the equivalent 16-bit TIFF, reports
+    // The numbers recorded from the reference tool for this image:
     // rmax/gmax/bmax 15000/52500/21000, the brightest green at 2,20 and the
     // crop 0,0,16,100. ImageMagick scales 16-bit to float by multiplying by a
     // float reciprocal of 65535, so the maxima are compared after scaling back

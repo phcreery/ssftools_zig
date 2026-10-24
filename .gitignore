@@ -20,3 +20,4 @@ zig-out/
 # *.pfm
 # *.tif
 # *.tiff
+test/

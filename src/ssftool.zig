@@ -1,37 +1,16 @@
-//! Zig port of `ssftool` (https://github.com/butcherg/ssftool).
+//! Operators that turn w,r,g,b spectrum rows into profile data.
 //!
-//! The port reproduces the original C++ program's stdout, stderr and exit
-//! status, including its idiosyncrasies:
+//! Input is comma-separated: one record per row, `#` starts a comment, spaces
+//! and tabs separate fields as commas do, and trailing whitespace is trimmed. A
+//! record whose text before `#` is empty is dropped, so a blank line vanishes
+//! while a whitespace-only one survives as empty fields.
 //!
-//!   * `getFile()` drops everything from the first '#' on, turns spaces and
-//!     tabs into field separators, trims trailing whitespace, and skips a line
-//!     only when the text before '#' is empty. A whitespace-only line is
-//!     therefore *not* skipped: it becomes one empty field per separator
-//!     character, i.e. a zero-valued row.
-//!   * wavelengths are read with `atoi` (truncated to int) and channels with
-//!     `atof`.
-//!   * a trailing empty field is not produced by the split (`"1,2,"` has two
-//!     fields), but interior ones are.
-//!   * output uses `%0.2f` for wavelengths and `%f` (six decimals) for
-//!     channels, byte-for-byte via `cformat`.
-//!   * every failure prints one line to stderr and exits 1; an unrecognized
-//!     operation prints a message and exits 0.
+//! Wavelengths are read as leading integers and channel values as leading
+//! decimals, so a field may carry a unit ("400nm"). Output writes wavelengths
+//! with two decimals and channels with six.
 //!
-//! Four upstream defects are deliberately *not* reproduced, because the
-//! original crashes, aborts or reads out of bounds; each is marked DEVIATION
-//! at its site and summarised in README.md:
-//!
-//!   1. `averagefiles` summed only `left[i].d[i]`, one channel per row, and
-//!      walked past the end of the row vector for more than three rows (the
-//!      original aborts on `_GLIBCXX_ASSERTIONS` builds). The documented
-//!      per-channel average is implemented instead.
-//!   2. `transpose` of ragged input read past the end of short rows (aborts
-//!      upstream); short rows yield empty fields here.
-//!   3. `averagefiles` with files of differing length read out of bounds.
-//!   4. `multiply <missing file>` dereferenced a null `FILE*` (SIGSEGV).
-//!
-//! `metadata` is also dead code upstream: `getFile()` has already removed the
-//! comment lines it looks for, so it prints nothing. That behaviour is kept.
+//! A failure prints one line to stderr and exits 1; an unrecognized operator is
+//! reported but exits 0.
 
 const std = @import("std");
 const Io = std.Io;
@@ -40,20 +19,22 @@ const cformat = @import("cformat.zig");
 
 pub const Error = error{ Ssftool, StreamTooLong } || Allocator.Error || Io.Reader.Error || Io.Writer.Error;
 
-/// `struct ssf_data`: a wavelength and up to three channel values.
 pub const Row = struct {
-    w: f32 = 0,
-    d: [3]f32 = .{ 0, 0, 0 },
-    /// Number of valid entries in `d` (1..3), as `d.size()` upstream.
-    n: u3 = 0,
+    /// Wavelength in nanometres.
+    wavelength: f32 = 0,
+    /// One to three channel values.
+    values: [3]f32 = .{ 0, 0, 0 },
+    /// How many entries of `values` are set.
+    count: u3 = 0,
 };
 
-/// `struct channeldata`.
+/// A wavelength reference: a column in the calibration data, its channel value,
+/// the wavelength that column is known to carry, and the local slope.
 pub const Marker = struct {
-    p: u32 = 0,
-    v: f32 = 0,
-    w: f32 = 0,
-    s: f32 = 0,
+    column: u32 = 0,
+    value: f32 = 0,
+    wavelength: f32 = 0,
+    slope: f32 = 0,
 };
 
 /// Per-invocation plumbing: allocator plus the two output streams.
@@ -65,234 +46,138 @@ pub const Ctx = struct {
     out: *Io.Writer,
     errw: *Io.Writer,
 
-    /// `err()`: message + newline to stderr, then a non-zero exit.
+    /// Reports a failure on stderr, one line.
     pub fn fail(c: Ctx, comptime fmt: []const u8, args: anytype) Error {
         c.errw.print(fmt ++ "\n", args) catch {};
         return error.Ssftool;
     }
 
-    /// `err()` for failures the front end detects itself.
+    /// `fail` for the CLI, whose call sites return an exit code.
     pub fn failCode(c: Ctx, comptime fmt: []const u8, args: anytype) u8 {
-        c.errw.print(fmt ++ "\n", args) catch {};
+        c.fail(fmt, args) catch {};
         return 1;
     }
 };
 
-/// f32 division whose operands the optimizer cannot see through.
-///
-/// `smooth` divides 0.0 by 0.0 on its first row and `normalize` divides by 0.0
-/// when every channel is zero. On x86-64 the hardware returns the indefinite
-/// QNaN, whose sign bit is set, so glibc prints "-nan"; LLVM folds constant
-/// `fdiv` to its own (positive) NaN. The volatile load keeps the hardware
-/// result, which is what the C build produces.
-fn div(a: f32, b: f32) f32 {
-    var x = a;
-    var y = b;
-    const px: *volatile f32 = &x;
-    const py: *volatile f32 = &y;
-    return px.* / py.*;
-}
-
 // ---------------------------------------------------------------------------
-// C library string/number primitives
+// Field parsing
 // ---------------------------------------------------------------------------
+//
+// Fields may carry a unit ("400nm"), so a leading number is taken and the rest
+// ignored. Anything unparsable is 0.
 
-fn isSpaceC(ch: u8) bool {
-    return ch == ' ' or ch == '\t' or ch == '\n' or ch == 0x0b or ch == 0x0c or ch == '\r';
-}
-
-/// `atoi`: skip whitespace, take an optional sign and decimal digits, ignore
-/// the rest. Overflow saturates like `strtol` before the truncation to `int`.
-pub fn cAtoi(s: []const u8) i32 {
+/// Leading integer: optional sign, then digits.
+pub fn intField(text: []const u8) i32 {
     var i: usize = 0;
-    while (i < s.len and isSpaceC(s[i])) i += 1;
-    var negative = false;
-    if (i < s.len and (s[i] == '+' or s[i] == '-')) {
-        negative = s[i] == '-';
-        i += 1;
-    }
-    var v: i64 = 0;
-    var saturated = false;
-    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
-        const digit: i64 = s[i] - '0';
-        if (saturated) continue;
-        if (v > @divTrunc(std.math.maxInt(i64) - digit, 10)) {
-            saturated = true;
-        } else {
-            v = v * 10 + digit;
-        }
-    }
-    if (saturated) {
-        v = if (negative) std.math.minInt(i64) else std.math.maxInt(i64);
-    } else if (negative) {
-        v = -v;
-    }
-    return @truncate(v);
-}
-
-fn isDigitC(ch: u8) bool {
-    return ch >= '0' and ch <= '9';
-}
-
-fn matchNoCase(haystack: []const u8, needle: []const u8) bool {
-    if (haystack.len < needle.len) return false;
-    for (needle, haystack[0..needle.len]) |a, b| {
-        if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
-    }
-    return true;
-}
-
-/// Length of the prefix `strtod` would consume, or 0 when there is no number.
-/// Leading whitespace is excluded from the result (see `cAtof`).
-fn scanFloat(s: []const u8) struct { start: usize, end: usize } {
-    var i: usize = 0;
-    while (i < s.len and isSpaceC(s[i])) i += 1;
+    while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
+    const negative = i < text.len and text[i] == '-';
+    if (i < text.len and (text[i] == '+' or text[i] == '-')) i += 1;
     const start = i;
+    while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
+    const digits = text[start..i];
+    if (digits.len == 0) return 0;
+    const magnitude = std.fmt.parseInt(i64, digits, 10) catch std.math.maxInt(i64);
+    return std.math.lossyCast(i32, if (negative) -magnitude else magnitude);
+}
 
-    if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
-    if (matchNoCase(s[i..], "infinity")) return .{ .start = start, .end = i + 8 };
-    if (matchNoCase(s[i..], "inf")) return .{ .start = start, .end = i + 3 };
-    if (matchNoCase(s[i..], "nan")) return .{ .start = start, .end = i + 3 };
+/// Leading decimal number: optional sign, digits with an optional point and
+/// exponent, or `inf`/`nan`.
+pub fn floatField(text: []const u8) f32 {
+    var i: usize = 0;
+    while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
+    const start = i;
+    if (i < text.len and (text[i] == '+' or text[i] == '-')) i += 1;
 
-    if (i + 1 < s.len and s[i] == '0' and (s[i + 1] == 'x' or s[i + 1] == 'X')) {
-        // Hexadecimal significand, as strtod accepts.
-        var j = i + 2;
-        var any = false;
-        while (j < s.len and std.ascii.isHex(s[j])) : (j += 1) any = true;
-        if (j < s.len and s[j] == '.') {
-            j += 1;
-            while (j < s.len and std.ascii.isHex(s[j])) : (j += 1) any = true;
+    if (std.ascii.startsWithIgnoreCase(text[i..], "infinity")) {
+        i += 8;
+    } else if (std.ascii.startsWithIgnoreCase(text[i..], "inf")) {
+        i += 3;
+    } else if (std.ascii.startsWithIgnoreCase(text[i..], "nan")) {
+        i += 3;
+    } else {
+        var digits = false;
+        while (i < text.len and std.ascii.isDigit(text[i])) : (i += 1) digits = true;
+        if (i < text.len and text[i] == '.') {
+            i += 1;
+            while (i < text.len and std.ascii.isDigit(text[i])) : (i += 1) digits = true;
         }
-        if (!any) return .{ .start = start, .end = 0 };
-        if (j < s.len and (s[j] == 'p' or s[j] == 'P')) {
-            var k = j + 1;
-            if (k < s.len and (s[k] == '+' or s[k] == '-')) k += 1;
-            if (k < s.len and isDigitC(s[k])) {
-                while (k < s.len and isDigitC(s[k])) k += 1;
-                j = k;
+        if (!digits) return 0;
+        if (i < text.len and (text[i] == 'e' or text[i] == 'E')) {
+            var j = i + 1;
+            if (j < text.len and (text[j] == '+' or text[j] == '-')) j += 1;
+            if (j < text.len and std.ascii.isDigit(text[j])) {
+                while (j < text.len and std.ascii.isDigit(text[j])) j += 1;
+                i = j;
             }
         }
-        return .{ .start = start, .end = j };
     }
-
-    var digits = false;
-    while (i < s.len and isDigitC(s[i])) : (i += 1) digits = true;
-    if (i < s.len and s[i] == '.') {
-        i += 1;
-        while (i < s.len and isDigitC(s[i])) : (i += 1) digits = true;
-    }
-    if (!digits) return .{ .start = start, .end = 0 };
-
-    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
-        var j = i + 1;
-        if (j < s.len and (s[j] == '+' or s[j] == '-')) j += 1;
-        if (j < s.len and isDigitC(s[j])) {
-            while (j < s.len and isDigitC(s[j])) j += 1;
-            i = j;
-        }
-    }
-    return .{ .start = start, .end = i };
+    const value = std.fmt.parseFloat(f64, text[start..i]) catch return 0;
+    return @floatCast(value);
 }
 
-/// `atof`: the longest numeric prefix of `s`, as a float. Anything unparsable
-/// (including an empty string) is 0.0, as in C.
-pub fn cAtof(s: []const u8) f32 {
-    const span = scanFloat(s);
-    if (span.end <= span.start) return 0;
-    const v = std.fmt.parseFloat(f64, s[span.start..span.end]) catch return 0;
-    return @floatCast(v);
+/// The text before the first `delim`, or all of it.
+pub fn firstField(text: []const u8, delim: u8) []const u8 {
+    return text[0 .. std.mem.indexOfScalar(u8, text, delim) orelse text.len];
 }
 
-/// `(int)` cast of a float as x86-64 `cvttss2si` performs it: truncation
-/// towards zero, and INT_MIN for NaN or anything out of range.
-pub fn floatToIntTrunc(v: f32) i32 {
-    if (!(v >= -2147483648.0) or v >= 2147483648.0) return std.math.minInt(i32);
-    return @intFromFloat(v);
-}
-
-/// The original's `split()`: one field per delimiter, and no trailing empty
-/// field after a final delimiter (`"a,b,"` -> `["a","b"]`).
-pub fn split(a: Allocator, s: []const u8, delim: []const u8) Error![]const []const u8 {
-    var out: std.ArrayList([]const u8) = .empty;
-    if (std.mem.indexOf(u8, s, delim) == null) {
-        try out.append(a, s);
-        return out.toOwnedSlice(a);
-    }
-    var pos: usize = 0;
-    while (pos < s.len) {
-        const start = pos;
-        pos = std.mem.indexOfPos(u8, s, pos, delim) orelse {
-            try out.append(a, s[start..]);
-            return out.toOwnedSlice(a);
-        };
-        try out.append(a, s[start..pos]);
-        pos += delim.len;
-    }
-    return out.toOwnedSlice(a);
+/// Every field of `text`, including a trailing empty one. Only `transpose`
+/// needs the fields addressable, so the allocation is worth it there.
+fn fields(a: Allocator, text: []const u8, delim: u8) Error![]const []const u8 {
+    var collected: std.ArrayList([]const u8) = .empty;
+    var parts = std.mem.splitScalar(u8, text, delim);
+    while (parts.next()) |part| try collected.append(a, part);
+    return collected.toOwnedSlice(a);
 }
 
 // ---------------------------------------------------------------------------
 // Input
 // ---------------------------------------------------------------------------
 
-/// `fgets(buffer, 256000, f)`: at most 255999 bytes, ending after a newline
-/// when one is in reach. Longer lines are therefore split into several records.
-const Fgets = struct {
-    data: []const u8,
-    pos: usize = 0,
-
-    fn next(self: *Fgets) ?[]const u8 {
-        if (self.pos >= self.data.len) return null;
-        const avail = self.data[self.pos..];
-        const take = @min(avail.len, 255999);
-        const end = if (std.mem.indexOfScalar(u8, avail[0..take], '\n')) |i| i + 1 else take;
-        defer self.pos += end;
-        return avail[0..end];
-    }
-};
-
-/// `getFile()`: the file's records with comments removed and separators
-/// normalised, ready for `parseData`/`list`.
+/// The input as records: everything from a '#' on is dropped, spaces and tabs
+/// separate fields, trailing whitespace is trimmed, and a record whose text
+/// before '#' is empty is skipped. A blank line therefore vanishes, while a
+/// whitespace-only one survives as empty fields.
 pub fn readLines(a: Allocator, reader: *Io.Reader) Error![]const []const u8 {
     const data = try reader.allocRemaining(a, .unlimited);
-    var lines: std.ArrayList([]const u8) = .empty;
-    var it: Fgets = .{ .data = data };
-    while (it.next()) |chunk| {
-        // fgets fills a byte buffer, but the original wraps it in std::string,
-        // which stops at the first NUL byte.
-        const raw = if (std.mem.indexOfScalar(u8, chunk, 0)) |i| chunk[0..i] else chunk;
-        const prefix = if (std.mem.indexOfScalar(u8, raw, '#')) |i| raw[0..i] else raw;
-        if (prefix.len == 0) continue;
+    if (data.len == 0) return &.{};
 
-        const line = try a.dupe(u8, prefix);
+    // The newline that ends the file ends the last record rather than starting
+    // an empty one; every other newline does start one, blank lines included.
+    const body = if (data[data.len - 1] == '\n') data[0 .. data.len - 1] else data;
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    var records = std.mem.splitScalar(u8, body, '\n');
+    while (records.next()) |record| {
+        // A comment line is dropped whole; text after '#' on a data line is
+        // dropped with it.
+        if (std.mem.startsWith(u8, record, "#")) continue;
+        const line = try a.dupe(u8, firstField(record, '#'));
         for (line) |*ch| {
             if (ch.* == ' ' or ch.* == '\t') ch.* = ',';
         }
-        var end = line.len;
-        while (end > 0 and (line[end - 1] == ' ' or line[end - 1] == '\n' or
-            line[end - 1] == '\r' or line[end - 1] == '\t')) end -= 1;
-        try lines.append(a, line[0..end]);
+        try lines.append(a, std.mem.trimEnd(u8, line, " \n\r\t"));
     }
     return lines.toOwnedSlice(a);
 }
 
-/// `get_Data()`.
+/// Parses records into rows.
 pub fn parseData(a: Allocator, c: Ctx, lines: []const []const u8) Error![]Row {
     var rows: std.ArrayList(Row) = .empty;
     for (lines) |line| {
-        if (line.len == 0) continue; // blank lines, usually at the end of a file
-        if (line[0] == '#') continue; // comments (already removed by readLines)
-        const tok = try split(a, line, ",");
-        if (tok.len < 2) {
+        if (line.len == 0) continue;
+        var parts = std.mem.splitScalar(u8, line, ',');
+        const wavelength = parts.next() orelse continue;
+        const first = parts.next() orelse {
             return c.fail("get_Data error: line does not contain sufficient number of values ({s})", .{line});
+        };
+
+        var row: Row = .{ .wavelength = @floatFromInt(intField(wavelength)), .values = .{ floatField(first), 0, 0 }, .count = 1 };
+        for (row.values[1..]) |*value| {
+            const part = parts.next() orelse break;
+            value.* = floatField(part);
+            row.count += 1;
         }
-        var r: Row = .{};
-        r.w = @floatFromInt(cAtoi(tok[0]));
-        r.d[0] = cAtof(tok[1]);
-        if (tok.len >= 3) r.d[1] = cAtof(tok[2]);
-        if (tok.len >= 4) r.d[2] = cAtof(tok[3]);
-        r.n = @intCast(@min(tok.len - 1, 3));
-        try rows.append(a, r);
+        try rows.append(a, row);
     }
     return rows.toOwnedSlice(a);
 }
@@ -302,8 +187,8 @@ pub fn parseData(a: Allocator, c: Ctx, lines: []const []const u8) Error![]Row {
 // ---------------------------------------------------------------------------
 
 fn printRow(c: Ctx, r: Row) Error!void {
-    try cformat.fixed(c.gpa, c.out, r.w, 2);
-    for (r.d[0..r.n]) |v| {
+    try cformat.fixed(c.gpa, c.out, r.wavelength, 2);
+    for (r.values[0..r.count]) |v| {
         try c.out.writeByte(',');
         try cformat.fixed(c.gpa, c.out, v, 6);
     }
@@ -324,9 +209,8 @@ pub fn list(c: Ctx, reader: *Io.Reader, wavelengths: bool) Error!void {
     if (lines.len == 0) return c.fail("list error: no data.", .{});
     if (wavelengths) {
         for (lines, 0..) |line, i| {
-            const tok = try split(a, line, ",");
             if (i != 0) try c.out.writeByte(',');
-            try c.out.writeAll(tok[0]);
+            try c.out.writeAll(firstField(line, ','));
         }
         try c.out.writeByte('\n');
     } else {
@@ -370,37 +254,36 @@ pub fn transpose(c: Ctx, reader: *Io.Reader) Error!void {
     if (lines.len == 0) return c.fail("transpose error: no data.", .{});
 
     const matrix = try a.alloc([]const []const u8, lines.len);
-    for (lines, matrix) |line, *tokens| tokens.* = try split(a, line, ",");
+    for (lines, matrix) |line, *row| row.* = try fields(a, line, ',');
 
     const cols = matrix[0].len;
     for (0..cols) |i| {
         for (matrix, 0..) |tokens, j| {
             if (j != 0) try c.out.writeByte(',');
-            // DEVIATION: the original reads past the end of shorter rows here
-            // (and aborts on hardened builds); empty fields are emitted.
+            // Short rows yield empty fields rather than an error.
             if (i < tokens.len) try c.out.writeAll(tokens[i]);
         }
         try c.out.writeByte('\n');
     }
 }
 
-/// `channelMaxes()`, returned as [blue, green, red].
+/// The brightest column of each channel, as [blue, green, red].
 pub fn channelMaxes(rows: []const Row) [3]Marker {
     var bmax: Marker = .{};
     var gmax: Marker = .{};
     var rmax: Marker = .{};
     for (rows, 0..) |r, i| {
-        if (r.n >= 1 and r.d[0] > rmax.v) {
-            rmax.v = r.d[0];
-            rmax.p = @intCast(i);
+        if (r.count >= 1 and r.values[0] > rmax.value) {
+            rmax.value = r.values[0];
+            rmax.column = @intCast(i);
         }
-        if (r.n >= 2 and r.d[1] > gmax.v) {
-            gmax.v = r.d[1];
-            gmax.p = @intCast(i);
+        if (r.count >= 2 and r.values[1] > gmax.value) {
+            gmax.value = r.values[1];
+            gmax.column = @intCast(i);
         }
-        if (r.n >= 3 and r.d[2] > bmax.v) {
-            bmax.v = r.d[2];
-            bmax.p = @intCast(i);
+        if (r.count >= 3 and r.values[2] > bmax.value) {
+            bmax.value = r.values[2];
+            bmax.column = @intCast(i);
         }
     }
     return .{ bmax, gmax, rmax };
@@ -412,56 +295,92 @@ pub fn channelMaxesOp(c: Ctx, reader: *Io.Reader) Error!void {
     if (lines.len == 0) return c.fail("channelmaxes error: no data.", .{});
     const m = channelMaxes(try parseData(a, c, lines));
     try c.out.writeAll("blue:");
-    try cformat.fixed(a, c.out, m[0].v, 6);
-    try c.out.print(",{d};green:", .{m[0].p});
-    try cformat.fixed(a, c.out, m[1].v, 6);
-    try c.out.print(",{d};red:", .{m[1].p});
-    try cformat.fixed(a, c.out, m[2].v, 6);
-    try c.out.print(",{d}\n", .{m[2].p});
+    try cformat.fixed(a, c.out, m[0].value, 6);
+    try c.out.print(",{d};green:", .{m[0].column});
+    try cformat.fixed(a, c.out, m[1].value, 6);
+    try c.out.print(",{d};red:", .{m[1].column});
+    try cformat.fixed(a, c.out, m[2].value, 6);
+    try c.out.print(",{d}\n", .{m[2].column});
 }
 
 /// `wavelengthcalibrate()`: anchor the markers, then walk the wavelength
 /// outwards from them at the local slope.
+///
+/// Markers may ascend or descend by column. A descending set — a capture whose
+/// long wavelengths sit on the right — is handled by mirroring the rows and the
+/// marker columns, running the ascending walk, and mirroring back, so the
+/// wavelengths land on the right pixels and descend down the file, which
+/// `intervalize` accepts. Upstream instead subtracts the unsigned columns, so a
+/// descending pair wraps to about 4e9 and every wavelength collapses onto the
+/// last marker.
 pub fn wavelengthCalibrate(c: Ctx, rows: []Row, markers: []Marker) Error!void {
     if (markers.len < 2) {
         return c.fail("wavelengthcalibrate error: need at least two markers", .{});
     }
 
+    for (markers) |mk| {
+        if (mk.column >= rows.len) {
+            return c.fail("wavelengthcalibrate error: marker position {d} is past the end of the data ({d} rows)", .{ mk.column, rows.len });
+        }
+    }
+
+    var ascending = true;
+    var descending = true;
+    for (0..markers.len - 1) |i| {
+        if (markers[i + 1].column == markers[i].column) {
+            return c.fail("wavelengthcalibrate error: two markers share column {d}", .{markers[i].column});
+        }
+        if (markers[i + 1].column > markers[i].column) descending = false else ascending = false;
+    }
+    if (!ascending and !descending) {
+        return c.fail("wavelengthcalibrate error: markers are in no consistent order", .{});
+    }
+    // Calibrate a descending capture in mirrored space: the walks below need
+    // ascending markers, so reverse the rows and reflect the columns first, then
+    // undo it on the way out. `mirror` is its own inverse, and the wavelengths
+    // ride along with their rows, so the caller gets its order and markers back
+    // with the wavelengths assigned. The `defer` must be at function scope:
+    // inside a block it would undo the mirror before the walks run.
+    if (descending) mirror(rows, markers);
+    defer if (descending) mirror(rows, markers);
+
     // 1. slope between consecutive markers.
     for (0..markers.len - 1) |i| {
-        const dw = markers[i + 1].w - markers[i].w;
-        // The original subtracts the unsigned positions, so a wrapped
-        // difference is reproduced with the same wrapping.
-        const dp: f32 = @floatFromInt(markers[i + 1].p -% markers[i].p);
-        markers[i].s = div(dw, dp);
+        const dw = markers[i + 1].wavelength - markers[i].wavelength;
+        // Markers ascend by column, checked above, so this cannot underflow.
+        const dp: f32 = @floatFromInt(markers[i + 1].column - markers[i].column);
+        markers[i].slope = dw / dp;
     }
-    markers[markers.len - 1].s = markers[markers.len - 2].s;
+    markers[markers.len - 1].slope = markers[markers.len - 2].slope;
 
     // 2. the markers' own wavelengths.
-    for (markers) |mk| {
-        if (mk.p >= rows.len) {
-            return c.fail("wavelengthcalibrate error: marker position {d} is past the end of the data ({d} rows)", .{ mk.p, rows.len });
-        }
-        rows[mk.p].w = mk.w;
-    }
+    for (markers) |mk| rows[mk.column].wavelength = mk.wavelength;
 
     // 3. between markers.
     for (0..markers.len - 1) |i| {
-        var j: u32 = markers[i].p;
-        while (j < markers[i + 1].p) : (j += 1) rows[j + 1].w = rows[j].w + markers[i].s;
+        var j: u32 = markers[i].column;
+        while (j < markers[i + 1].column) : (j += 1) rows[j + 1].wavelength = rows[j].wavelength + markers[i].slope;
     }
 
     // 4. from the highest marker to the end of the spectrum.
     if (rows.len >= 2) {
-        const s = markers[markers.len - 1].s;
-        var j: u32 = markers[markers.len - 1].p;
-        while (j < rows.len - 1) : (j += 1) rows[j + 1].w = rows[j].w + s;
-        rows[rows.len - 1].w = rows[rows.len - 2].w + s;
+        const s = markers[markers.len - 1].slope;
+        var j: u32 = markers[markers.len - 1].column;
+        while (j < rows.len - 1) : (j += 1) rows[j + 1].wavelength = rows[j].wavelength + s;
+        rows[rows.len - 1].wavelength = rows[rows.len - 2].wavelength + s;
     }
 
     // 5. from the lowest marker down to the start of the spectrum.
-    var j: u32 = markers[0].p;
-    while (j > 0) : (j -= 1) rows[j - 1].w = rows[j].w - markers[0].s;
+    var j: u32 = markers[0].column;
+    while (j > 0) : (j -= 1) rows[j - 1].wavelength = rows[j].wavelength - markers[0].slope;
+}
+
+/// Reverses the rows and reflects the marker columns, so a descending capture
+/// looks ascending. It is its own inverse: applying it twice restores both,
+/// while the wavelengths assigned in between ride along with their rows.
+fn mirror(rows: []Row, markers: []Marker) void {
+    std.mem.reverse(Row, rows);
+    for (markers) |*mk| mk.column = @intCast(rows.len - 1 - mk.column);
 }
 
 /// `wavelengthcalibrate <file> red=..,green=..,blue=.. <calibfile>`: the
@@ -477,66 +396,63 @@ pub fn wavelengthCalibrateRgb(
     const a = c.gpa;
     const calib_rows = try parseData(a, c, try readLines(a, calib_reader));
     var markers = channelMaxes(calib_rows);
-    markers[0].w = @floatFromInt(bluew);
-    markers[1].w = @floatFromInt(greenw);
-    markers[2].w = @floatFromInt(redw);
+    markers[0].wavelength = @floatFromInt(bluew);
+    markers[1].wavelength = @floatFromInt(greenw);
+    markers[2].wavelength = @floatFromInt(redw);
 
     var used: [3]Marker = undefined;
-    var n: usize = 0;
+    var used_count: usize = 0;
     for (markers) |mk| {
-        if (mk.w != 0) {
-            used[n] = mk;
-            n += 1;
+        if (mk.wavelength != 0) {
+            used[used_count] = mk;
+            used_count += 1;
         }
     }
-    if (n < 2) return c.fail("wavelengthcalibrate (RGB) error: need at least two channels", .{});
+    if (used_count < 2) return c.fail("wavelengthcalibrate (RGB) error: need at least two channels", .{});
 
     const rows = try parseData(a, c, try readLines(a, reader));
     if (rows.len == 0) return c.fail("wavelengthcalibrate error: no data.", .{});
 
-    try wavelengthCalibrate(c, rows, used[0..n]);
+    try wavelengthCalibrate(c, rows, used[0..used_count]);
     try printRows(c, rows);
 }
 
 /// Sums `other` into `data`, channel by channel.
 ///
-/// DEVIATION: upstream accumulated `data[i].d[i] += other[i].d[i]`, which sums
-/// one channel per row (row 0's red, row 1's green, row 2's blue, ...) and,
-/// from the fourth row on, indexes past the end of a three-channel row, which
-/// aborts on a hardened build.
 fn addRows(data: []Row, other: []const Row) void {
     for (data, other) |*left, right| {
-        for (0..@min(left.n, right.n)) |j| left.d[j] += right.d[j];
+        for (0..@min(left.count, right.count)) |j| left.values[j] += right.values[j];
     }
 }
 
-const PowerEntry = struct { w: i32, v: f32 };
+const PowerEntry = struct { wavelength: i32, value: f32 };
 
-/// `getPowerData()`: a map keyed by integer wavelength; a repeated wavelength
-/// keeps the last value, and the result is ordered by wavelength.
+/// Power calibration entries, one per integer wavelength, ordered by
+/// wavelength. A repeated wavelength keeps the last value.
 fn powerData(a: Allocator, c: Ctx, lines: []const []const u8) Error![]PowerEntry {
     var entries: std.ArrayList(PowerEntry) = .empty;
     for (lines) |line| {
-        // Note: unlike get_Data, blank lines are not skipped here.
-        const tok = try split(a, line, ",");
-        if (tok.len < 2) {
+        // Note: unlike parseData, blank lines are not skipped here.
+        var parts = std.mem.splitScalar(u8, line, ',');
+        const wavelength = parts.next() orelse continue;
+        const value = parts.next() orelse {
             return c.fail("getPowerData error: line does not contain sufficient number of values ({s})", .{line});
-        }
-        const w = cAtoi(tok[0]);
-        const v = cAtof(tok[1]);
+        };
+        const w = intField(wavelength);
+        const v = floatField(value);
         var replaced = false;
         for (entries.items) |*e| {
-            if (e.w == w) {
-                e.v = v;
+            if (e.wavelength == w) {
+                e.value = v;
                 replaced = true;
                 break;
             }
         }
-        if (!replaced) try entries.append(a, .{ .w = w, .v = v });
+        if (!replaced) try entries.append(a, .{ .wavelength = w, .value = v });
     }
     std.mem.sort(PowerEntry, entries.items, {}, struct {
         fn lt(_: void, x: PowerEntry, y: PowerEntry) bool {
-            return x.w < y.w;
+            return x.wavelength < y.wavelength;
         }
     }.lt);
     return entries.toOwnedSlice(a);
@@ -547,7 +463,7 @@ pub fn powerCalibrate(c: Ctx, io: Io, reader: *Io.Reader, calib_path: []const u8
     const rows = try parseData(a, c, try readLines(a, reader));
     if (rows.len == 0) return c.fail("powercalibrate error: no data.", .{});
 
-    // Opened only after the data has been read, as upstream does.
+    // Opened after the data is read, so a bad data file is reported first.
     const file = Io.Dir.cwd().openFile(io, calib_path, .{}) catch return c.fail(
         "powercalibrate error: power calibration file {s} not found.",
         .{calib_path},
@@ -559,40 +475,41 @@ pub fn powerCalibrate(c: Ctx, io: Io, reader: *Io.Reader, calib_path: []const u8
     const calib = try powerData(a, c, try readLines(a, &fr.interface));
 
     for (rows) |*r| {
-        const key = floatToIntTrunc(r.w);
+        const key = std.math.lossyCast(i32, r.wavelength);
         var factor: f32 = undefined;
 
         var exact: ?usize = null;
         for (calib, 0..) |e, i| {
-            if (e.w == key) {
+            if (e.wavelength == key) {
                 exact = i;
                 break;
             }
         }
 
         if (exact) |i| {
-            factor = calib[i].v;
+            factor = calib[i].value;
         } else {
             // lower_bound: first entry at or above the wavelength.
             var hi: usize = 0;
-            while (hi < calib.len and calib[hi].w < key) hi += 1;
-            // DEVIATION: the original dereferences the end/begin iterators
-            // here, reading uninitialised memory.
+            while (hi < calib.len and calib[hi].wavelength < key) hi += 1;
+            // Outside the calibration range there is nothing to interpolate
+            // against.
             if (hi == 0 or hi >= calib.len) {
                 try c.errw.writeAll("powercalibrate error: wavelength ");
-                try cformat.fixed(a, c.errw, r.w, 2);
+                try cformat.fixed(a, c.errw, r.wavelength, 2);
                 try c.errw.writeAll(" is outside the power calibration range\n");
                 return error.Ssftool;
             }
+            // Linear interpolation between the keys either side; the two
+            // wavelengths are integers, so their difference is exact.
             const lo = hi - 1;
-            const mult = div(
-                r.w - @as(f32, @floatFromInt(calib[hi].w)),
-                @as(f32, @floatFromInt(calib[lo].w - calib[hi].w)),
-            );
-            factor = calib[hi].v + (calib[lo].v - calib[hi].v) * mult;
+            const above = r.wavelength - @as(f32, @floatFromInt(calib[hi].wavelength));
+            const span = @as(f32, @floatFromInt(calib[lo].wavelength - calib[hi].wavelength));
+            const fraction = above / span;
+            factor = calib[hi].value + (calib[lo].value - calib[hi].value) * fraction;
         }
 
-        for (r.d[0..r.n]) |*d| d.* = div(d.*, factor);
+        for (r.values[0..r.count]) |*d| d.* = d.* / factor;
     }
     try printRows(c, rows);
 }
@@ -603,12 +520,12 @@ pub fn normalize(c: Ctx, reader: *Io.Reader) Error!void {
 
     var maxval: f32 = 0.0;
     for (rows) |r| {
-        for (r.d[0..r.n]) |v| {
+        for (r.values[0..r.count]) |v| {
             if (v > maxval) maxval = v;
         }
     }
     for (rows) |*r| {
-        for (r.d[0..r.n]) |*d| d.* = div(d.*, maxval);
+        for (r.values[0..r.count]) |*d| d.* = d.* / maxval;
     }
     try printRows(c, rows);
 }
@@ -617,7 +534,7 @@ pub fn multiply(c: Ctx, reader: *Io.Reader, m: f32) Error!void {
     const rows = try parseData(c.gpa, c, try readLines(c.gpa, reader));
     if (rows.len == 0) return c.fail("normalize error: no data.", .{});
     for (rows) |*r| {
-        for (r.d[0..r.n]) |*d| d.* *= m;
+        for (r.values[0..r.count]) |*d| d.* *= m;
     }
     try printRows(c, rows);
 }
@@ -628,20 +545,16 @@ pub fn averageChannels(c: Ctx, reader: *Io.Reader) Error!void {
     if (rows.len == 0) return c.fail("average error: no data.", .{});
     for (rows) |r| {
         var sum: f32 = 0.0;
-        for (r.d[0..r.n]) |v| sum += v;
-        try cformat.fixed(c.gpa, c.out, r.w, 2);
+        for (r.values[0..r.count]) |v| sum += v;
+        try cformat.fixed(c.gpa, c.out, r.wavelength, 2);
         try c.out.writeByte(',');
-        try cformat.fixed(c.gpa, c.out, div(sum, @floatFromInt(r.n)), 6);
+        try cformat.fixed(c.gpa, c.out, sum / @as(f32, @floatFromInt(r.count)), 6);
         try c.out.writeByte('\n');
     }
 }
 
 /// `averagefiles`: the per-channel mean across every input file.
 ///
-/// DEVIATION: the original accumulated `left[i].d[i] += right[i].d[i]`, which
-/// mixes channels within a row and walks off the end of the row's channel
-/// vector after the third row (SIGABRT on a hardened build). The documented
-/// per-channel average is implemented instead.
 pub fn averageFiles(c: Ctx, io: Io, stdin_reader: *Io.Reader, paths: []const []const u8) Error!void {
     const a = c.gpa;
     var data = try parseData(a, c, try readLines(a, stdin_reader));
@@ -660,8 +573,7 @@ pub fn averageFiles(c: Ctx, io: Io, stdin_reader: *Io.Reader, paths: []const []c
         if (data.len == 0) {
             data = other;
         } else {
-            // DEVIATION: the original reads out of bounds when the files differ
-            // in length.
+            // The files have to line up row for row.
             if (other.len != data.len) {
                 return c.fail("averagefiles error: data files have different numbers of lines", .{});
             }
@@ -672,14 +584,14 @@ pub fn averageFiles(c: Ctx, io: Io, stdin_reader: *Io.Reader, paths: []const []c
 
     const divisor: f32 = @floatFromInt(count);
     for (data) |*r| {
-        for (r.d[0..r.n]) |*d| d.* = div(d.*, divisor);
+        for (r.values[0..r.count]) |*d| d.* = d.* / divisor;
     }
     try printRows(c, data);
 }
 
 /// `linearpower <lower,upper,interval,lowvalue,highvalue>`.
 pub fn linearPower(c: Ctx, lower: f32, upper: f32, interval: f32, lowval: f32, hival: f32) Error!void {
-    const increment = div(hival - lowval, div(upper - lower, interval));
+    const increment = (hival - lowval) / ((upper - lower) / interval);
     try cformat.fixed(c.gpa, c.out, lower, 2);
     try c.out.writeByte(',');
     try cformat.fixed(c.gpa, c.out, lowval, 6);
@@ -701,22 +613,30 @@ pub fn linearPower(c: Ctx, lower: f32, upper: f32, interval: f32, lowval: f32, h
     try c.out.writeByte('\n');
 }
 
-/// `intervalize`: resample onto a fixed wavelength grid, choosing the nearest
-/// neighbouring measurement (the interpolation is left as a TODO upstream).
+/// `intervalize`: resample onto a fixed wavelength grid, taking the nearest
+/// measurement to each step. A descending axis is walked the other way.
 pub fn intervalize(c: Ctx, reader: *Io.Reader, lower: f32, upper: f32, interval: f32) Error!void {
     const a = c.gpa;
     const rows = try parseData(a, c, try readLines(a, reader));
     if (rows.len == 0) return c.fail("intervalize error: no data.", .{});
 
-    if (rows[0].w > lower) {
+    // A descending wavelength axis — a mirrored capture, straight out of
+    // wavelengthcalibrate — is walked the other way. The output is still one row
+    // per step from `lower` upwards, and the `defer` puts the caller's row order
+    // back, including on the error paths below.
+    const descending = rows.len >= 2 and rows[0].wavelength > rows[rows.len - 1].wavelength;
+    if (descending) std.mem.reverse(Row, rows);
+    defer if (descending) std.mem.reverse(Row, rows);
+
+    if (rows[0].wavelength > lower) {
         try c.errw.writeAll("intervalize error: data doesn't cover lower bound: ");
-        try cformat.fixed(a, c.errw, rows[0].w, 2);
+        try cformat.fixed(a, c.errw, rows[0].wavelength, 2);
         try c.errw.writeByte('\n');
         return error.Ssftool;
     }
-    if (rows[rows.len - 1].w < upper) {
+    if (rows[rows.len - 1].wavelength < upper) {
         try c.errw.writeAll("intervalize error: data doesn't cover upper bound: ");
-        try cformat.fixed(a, c.errw, rows[rows.len - 1].w, 2);
+        try cformat.fixed(a, c.errw, rows[rows.len - 1].wavelength, 2);
         try c.errw.writeByte('\n');
         return error.Ssftool;
     }
@@ -726,29 +646,38 @@ pub fn intervalize(c: Ctx, reader: *Io.Reader, lower: f32, upper: f32, interval:
     var step = lower;
     while (step <= upper) : (step += interval) {
         // Walk up to the lower bound.
-        while (i < last and rows[i].w < lower) i += 1;
+        while (i < last and rows[i].wavelength < lower) i += 1;
 
-        if (rows[i].w == step) { // exact hit: use the measurement as-is
+        if (rows[i].wavelength == step) { // exact hit: use the measurement as-is
             try printRow(c, rows[i]);
             i += 1;
             continue;
         }
-        while (i < last and rows[i].w < step) i += 1;
+        while (i < last and rows[i].wavelength < step) i += 1;
+        // The walk can land exactly on the step, which the test above cannot
+        // see because it runs before the walk. Upstream then divides by a zero
+        // interval, so `interp` is infinite and it takes the *next*
+        // measurement; take this one instead.
+        if (rows[i].wavelength == step) {
+            try printRow(c, rows[i]);
+            i += 1;
+            continue;
+        }
 
-        var out: Row = .{ .w = step };
+        var out: Row = .{ .wavelength = step };
         if (i == last) {
             // Past the end of the data: take the last measurement.
-            out.n = rows[i].n;
-            out.d = rows[i].d;
+            out.count = rows[i].count;
+            out.values = rows[i].values;
             try printRow(c, out);
             return;
         }
         // Nearest neighbour: `interp` is the fraction of the interval between
         // this measurement and the next.
-        const interp = div(rows[i + 1].w - rows[i].w, rows[i].w - step);
-        out.n = rows[i].n;
-        for (0..rows[i].n) |j| {
-            out.d[j] = if (interp > 0.5) rows[i + 1].d[j] else rows[i].d[j];
+        const interp = (rows[i + 1].wavelength - rows[i].wavelength) / (rows[i].wavelength - step);
+        out.count = rows[i].count;
+        for (0..rows[i].count) |j| {
+            out.values[j] = if (interp > 0.5) rows[i + 1].values[j] else rows[i].values[j];
         }
         try printRow(c, out);
         i += 1;
@@ -761,8 +690,8 @@ pub fn formatOp(c: Ctx, reader: *Io.Reader, precision: i32) Error!void {
     const rows = try parseData(a, c, try readLines(a, reader));
     if (rows.len == 0) return c.fail("ssfformat error: no data.", .{});
     for (rows) |r| {
-        try cformat.int(c.out, floatToIntTrunc(r.w));
-        for (r.d[0..r.n]) |v| {
+        try cformat.int(c.out, std.math.lossyCast(i32, r.wavelength));
+        for (r.values[0..r.count]) |v| {
             try c.out.writeByte(',');
             try cformat.fixed(a, c.out, v, precision);
         }
@@ -778,24 +707,19 @@ pub fn smooth(c: Ctx, reader: *Io.Reader, lookback: i32) Error!void {
 
     for (rows, 0..) |r, i| {
         const lb: usize = if (lookback < 0) i else @min(i, @as(usize, @intCast(lookback)));
-        var out: Row = .{ .w = r.w, .n = r.n };
-        for (0..r.n) |j| {
+        var out: Row = .{ .wavelength = r.wavelength, .count = r.count };
+        for (0..r.count) |j| {
             var sum: f32 = 0.0;
             var k: usize = 0;
-            while (k < lb) : (k += 1) sum += rows[i - k].d[j];
-            out.d[j] = div(sum, @floatFromInt(lb));
+            while (k < lb) : (k += 1) sum += rows[i - k].values[j];
+            out.values[j] = sum / @as(f32, @floatFromInt(lb));
         }
         try printRow(c, out);
     }
 }
 
-/// `metadata`: prints nothing, and never has.
-///
-/// The original reads through `getFile()`, which already truncates every line
-/// at the first '#' and drops the ones that become empty, so the `line[0] ==
-/// '#'` test in `getMetadata()` can never be true. The operator is dead code
-/// upstream; this port keeps the observable behaviour (no output, status 0)
-/// rather than inventing a different one.
+/// `metadata`: prints nothing. The line reader has already dropped every
+/// comment, so there is nothing left to report.
 pub fn metadata(c: Ctx, reader: *Io.Reader) Error!void {
     _ = try readLines(c.gpa, reader);
 }
@@ -806,56 +730,52 @@ pub fn metadata(c: Ctx, reader: *Io.Reader) Error!void {
 
 const testing = std.testing;
 
-test "cAtoi matches atoi" {
-    try testing.expectEqual(@as(i32, 0), cAtoi(""));
-    try testing.expectEqual(@as(i32, 0), cAtoi("x"));
-    try testing.expectEqual(@as(i32, 42), cAtoi("42"));
-    try testing.expectEqual(@as(i32, 42), cAtoi("  42abc"));
-    try testing.expectEqual(@as(i32, -42), cAtoi("-42"));
-    try testing.expectEqual(@as(i32, 42), cAtoi("+42"));
-    try testing.expectEqual(@as(i32, 12), cAtoi("12.9")); // atoi stops at '.'
-    try testing.expectEqual(@as(i32, 400), cAtoi("400\n"));
+test "intField takes a leading integer" {
+    try testing.expectEqual(@as(i32, 0), intField(""));
+    try testing.expectEqual(@as(i32, 0), intField("x"));
+    try testing.expectEqual(@as(i32, 42), intField("42"));
+    try testing.expectEqual(@as(i32, 42), intField("  42abc"));
+    try testing.expectEqual(@as(i32, -42), intField("-42"));
+    try testing.expectEqual(@as(i32, 42), intField("+42"));
+    try testing.expectEqual(@as(i32, 12), intField("12.9"));
+    try testing.expectEqual(@as(i32, 400), intField("400nm"));
 }
 
-test "cAtof matches atof" {
-    try testing.expectEqual(@as(f32, 0), cAtof(""));
-    try testing.expectEqual(@as(f32, 0), cAtof("x"));
-    try testing.expectEqual(@as(f32, 1.5), cAtof("1.5"));
-    try testing.expectEqual(@as(f32, 0.000071), cAtof("0.000071"));
-    try testing.expectEqual(@as(f32, 1.5), cAtof("1.5x"));
-    try testing.expectEqual(@as(f32, -1.5), cAtof(" -1.5e0"));
-    try testing.expectEqual(@as(f32, 150), cAtof("1.5e2"));
-    try testing.expectEqual(@as(f32, 0.5), cAtof(".5"));
-    try testing.expect(std.math.isInf(cAtof("inf")));
-    try testing.expect(std.math.isNan(cAtof("nan")));
+test "floatField takes a leading number" {
+    try testing.expectEqual(@as(f32, 0), floatField(""));
+    try testing.expectEqual(@as(f32, 0), floatField("x"));
+    try testing.expectEqual(@as(f32, 1.5), floatField("1.5"));
+    try testing.expectEqual(@as(f32, 0.000071), floatField("0.000071"));
+    try testing.expectEqual(@as(f32, 1.5), floatField("1.5x"));
+    try testing.expectEqual(@as(f32, -1.5), floatField(" -1.5e0"));
+    try testing.expectEqual(@as(f32, 150), floatField("1.5e2"));
+    try testing.expectEqual(@as(f32, 0.5), floatField(".5"));
+    try testing.expect(std.math.isInf(floatField("inf")));
+    try testing.expect(std.math.isNan(floatField("nan")));
 }
 
-test "split drops a trailing empty field" {
+test "fields keep a trailing empty one" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const one = try split(a, "a", ",");
+    const one = try fields(a, "a", ',');
     try testing.expectEqual(@as(usize, 1), one.len);
     try testing.expectEqualStrings("a", one[0]);
 
-    const two = try split(a, "a,b", ",");
-    try testing.expectEqual(@as(usize, 2), two.len);
-    try testing.expectEqualStrings("a", two[0]);
-    try testing.expectEqualStrings("b", two[1]);
+    const trailing = try fields(a, "a,b,", ',');
+    try testing.expectEqual(@as(usize, 3), trailing.len);
+    try testing.expectEqualStrings("", trailing[2]);
 
-    const trailing = try split(a, "a,b,", ",");
-    try testing.expectEqual(@as(usize, 2), trailing.len);
+    const empty = try fields(a, ",", ',');
+    try testing.expectEqual(@as(usize, 2), empty.len);
 
-    const empty = try split(a, ",", ",");
-    try testing.expectEqual(@as(usize, 1), empty.len);
-    try testing.expectEqualStrings("", empty[0]);
-
-    const four = try split(a, ",,,", ",");
-    try testing.expectEqual(@as(usize, 3), four.len);
+    try testing.expectEqualStrings("a", firstField("a,b,c", ','));
+    try testing.expectEqualStrings("a", firstField("a", ','));
+    try testing.expectEqualStrings("", firstField(",b", ','));
 }
 
-test "readLines reproduces getFile" {
+test "readLines applies the field dialect" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -871,7 +791,7 @@ test "readLines reproduces getFile" {
     try testing.expectEqualStrings("4,5,6", lines[5]); // no trailing newline
 }
 
-test "parseData reads wavelengths with atoi and channels with atof" {
+test "parseData reads a wavelength and up to three channels" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -885,10 +805,10 @@ test "parseData reads wavelengths with atoi and channels with atof" {
     var reader = Io.Reader.fixed("400.7,1,2,3\n405,4,5\n\n");
     const rows = try parseData(a, c, try readLines(a, &reader));
     try testing.expectEqual(@as(usize, 2), rows.len);
-    try testing.expectEqual(@as(f32, 400), rows[0].w);
-    try testing.expectEqual(@as(u3, 3), rows[0].n);
-    try testing.expectEqual(@as(f32, 2), rows[0].d[1]);
-    try testing.expectEqual(@as(u3, 2), rows[1].n);
+    try testing.expectEqual(@as(f32, 400), rows[0].wavelength);
+    try testing.expectEqual(@as(u3, 3), rows[0].count);
+    try testing.expectEqual(@as(f32, 2), rows[0].values[1]);
+    try testing.expectEqual(@as(u3, 2), rows[1].count);
 }
 
 test "parseData rejects a short line" {
@@ -910,41 +830,135 @@ test "parseData rejects a short line" {
     );
 }
 
+test "descending markers calibrate a mirrored capture" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var rows = [_]Row{
+        .{ .wavelength = 0, .values = .{ 1, 2, 3 }, .count = 3 },
+        .{ .wavelength = 1, .values = .{ 1, 2, 3 }, .count = 3 },
+        .{ .wavelength = 2, .values = .{ 1, 2, 3 }, .count = 3 },
+        .{ .wavelength = 3, .values = .{ 1, 2, 3 }, .count = 3 },
+        .{ .wavelength = 4, .values = .{ 1, 2, 3 }, .count = 3 },
+    };
+    // Column 4 is 400 nm and column 2 is 500 nm, so the capture is mirrored:
+    // the wavelengths must descend down the file, 600 at column 0.
+    var markers = [_]Marker{
+        .{ .column = 4, .wavelength = 400 },
+        .{ .column = 2, .wavelength = 500 },
+    };
+
+    var sink: [256]u8 = undefined;
+    var out: Io.Writer = .fixed(&sink);
+    var err_buf: [256]u8 = undefined;
+    var errw: Io.Writer = .fixed(&err_buf);
+    const c: Ctx = .{ .gpa = a, .out = &out, .errw = &errw };
+
+    try wavelengthCalibrate(c, &rows, &markers);
+    const want = [_]f32{ 600, 550, 500, 450, 400 };
+    for (rows, want) |row, w| try testing.expectApproxEqAbs(w, row.wavelength, 0.001);
+    // The marker columns are restored, so the caller's data is untouched
+    // apart from the wavelengths.
+    try testing.expectEqual(@as(u32, 4), markers[0].column);
+    try testing.expectEqual(@as(u32, 2), markers[1].column);
+}
+
+test "intervalize walks a descending wavelength axis" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var sink: [1024]u8 = undefined;
+    var out: Io.Writer = .fixed(&sink);
+    var err_buf: [256]u8 = undefined;
+    var errw: Io.Writer = .fixed(&err_buf);
+    const c: Ctx = .{ .gpa = a, .out = &out, .errw = &errw };
+
+    var reader = Io.Reader.fixed("500,5\n480,4\n460,3\n440,2\n420,1\n");
+    try intervalize(c, &reader, 420, 500, 40);
+    try testing.expectEqualStrings(
+        \\420.00,1.000000
+        \\460.00,3.000000
+        \\500.00,5.000000
+        \\
+    , out.buffered());
+}
+
+test "rejects markers with no consistent order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var rows = [_]Row{
+        .{ .wavelength = 0, .values = .{ 1, 2, 3 }, .count = 3 },
+        .{ .wavelength = 1, .values = .{ 1, 2, 3 }, .count = 3 },
+        .{ .wavelength = 2, .values = .{ 1, 2, 3 }, .count = 3 },
+        .{ .wavelength = 3, .values = .{ 1, 2, 3 }, .count = 3 },
+    };
+    var mixed = [_]Marker{
+        .{ .column = 3, .wavelength = 400 },
+        .{ .column = 1, .wavelength = 500 },
+        .{ .column = 2, .wavelength = 600 },
+    };
+    var duplicate = [_]Marker{
+        .{ .column = 1, .wavelength = 400 },
+        .{ .column = 1, .wavelength = 500 },
+    };
+
+    var sink: [256]u8 = undefined;
+    var out: Io.Writer = .fixed(&sink);
+    var err_buf: [256]u8 = undefined;
+    var errw: Io.Writer = .fixed(&err_buf);
+    const c: Ctx = .{ .gpa = a, .out = &out, .errw = &errw };
+
+    try testing.expectError(error.Ssftool, wavelengthCalibrate(c, &rows, &mixed));
+    try testing.expectEqualStrings("wavelengthcalibrate error: markers are in no consistent order\n", errw.buffered());
+
+    var sink2: [256]u8 = undefined;
+    var out2: Io.Writer = .fixed(&sink2);
+    var err_buf2: [256]u8 = undefined;
+    var errw2: Io.Writer = .fixed(&err_buf2);
+    const c2: Ctx = .{ .gpa = a, .out = &out2, .errw = &errw2 };
+    try testing.expectError(error.Ssftool, wavelengthCalibrate(c2, &rows, &duplicate));
+    try testing.expectEqualStrings("wavelengthcalibrate error: two markers share column 1\n", errw2.buffered());
+}
+
 test "averagefiles sums every channel of every row" {
     var left = [_]Row{
-        .{ .w = 400, .d = .{ 1, 2, 3 }, .n = 3 },
-        .{ .w = 405, .d = .{ 4, 5, 6 }, .n = 3 },
-        .{ .w = 410, .d = .{ 7, 8, 9 }, .n = 3 },
-        .{ .w = 415, .d = .{ 10, 11, 12 }, .n = 3 },
+        .{ .wavelength = 400, .values = .{ 1, 2, 3 }, .count = 3 },
+        .{ .wavelength = 405, .values = .{ 4, 5, 6 }, .count = 3 },
+        .{ .wavelength = 410, .values = .{ 7, 8, 9 }, .count = 3 },
+        .{ .wavelength = 415, .values = .{ 10, 11, 12 }, .count = 3 },
     };
     const right = [_]Row{
-        .{ .w = 400, .d = .{ 10, 20, 30 }, .n = 3 },
-        .{ .w = 405, .d = .{ 40, 50, 60 }, .n = 3 },
-        .{ .w = 410, .d = .{ 70, 80, 90 }, .n = 3 },
-        .{ .w = 415, .d = .{ 100, 110, 120 }, .n = 3 },
+        .{ .wavelength = 400, .values = .{ 10, 20, 30 }, .count = 3 },
+        .{ .wavelength = 405, .values = .{ 40, 50, 60 }, .count = 3 },
+        .{ .wavelength = 410, .values = .{ 70, 80, 90 }, .count = 3 },
+        .{ .wavelength = 415, .values = .{ 100, 110, 120 }, .count = 3 },
     };
     addRows(&left, &right);
 
-    try testing.expectEqual(@as(f32, 11), left[0].d[0]);
-    try testing.expectEqual(@as(f32, 22), left[0].d[1]);
-    try testing.expectEqual(@as(f32, 33), left[0].d[2]);
-    // Rows past the third are the ones upstream reads out of bounds on.
-    try testing.expectEqual(@as(f32, 110), left[3].d[0]);
-    try testing.expectEqual(@as(f32, 121), left[3].d[1]);
-    try testing.expectEqual(@as(f32, 132), left[3].d[2]);
+    try testing.expectEqual(@as(f32, 11), left[0].values[0]);
+    try testing.expectEqual(@as(f32, 22), left[0].values[1]);
+    try testing.expectEqual(@as(f32, 33), left[0].values[2]);
+    // Every channel of every row is summed, including rows past the third.
+    try testing.expectEqual(@as(f32, 110), left[3].values[0]);
+    try testing.expectEqual(@as(f32, 121), left[3].values[1]);
+    try testing.expectEqual(@as(f32, 132), left[3].values[2]);
 }
 
 test "channelMaxes picks the first maximum and orders blue,green,red" {
     var rows = [_]Row{
-        .{ .w = 0, .d = .{ 1, 9, 3 }, .n = 3 },
-        .{ .w = 1, .d = .{ 9, 9, 3 }, .n = 3 },
-        .{ .w = 2, .d = .{ 4, 5, 8 }, .n = 3 },
+        .{ .wavelength = 0, .values = .{ 1, 9, 3 }, .count = 3 },
+        .{ .wavelength = 1, .values = .{ 9, 9, 3 }, .count = 3 },
+        .{ .wavelength = 2, .values = .{ 4, 5, 8 }, .count = 3 },
     };
     const m = channelMaxes(&rows);
-    try testing.expectEqual(@as(u32, 2), m[0].p); // blue
-    try testing.expectEqual(@as(f32, 8), m[0].v);
-    try testing.expectEqual(@as(u32, 0), m[1].p); // green: ties keep the first
-    try testing.expectEqual(@as(f32, 9), m[1].v);
-    try testing.expectEqual(@as(u32, 1), m[2].p); // red
-    try testing.expectEqual(@as(f32, 9), m[2].v);
+    try testing.expectEqual(@as(u32, 2), m[0].column); // blue
+    try testing.expectEqual(@as(f32, 8), m[0].value);
+    try testing.expectEqual(@as(u32, 0), m[1].column); // green: ties keep the first
+    try testing.expectEqual(@as(f32, 9), m[1].value);
+    try testing.expectEqual(@as(u32, 1), m[2].column); // red
+    try testing.expectEqual(@as(f32, 9), m[2].value);
 }
